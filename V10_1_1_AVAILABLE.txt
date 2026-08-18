@@ -1,1 +1,14 @@
-V10.1.1 source verified locally. SHA256 284cfa1e8829ec9d9893aec4f48768dca4b9c23a6b94281972418e78c68422e1
+V10.1.1 source verified locally.
+
+Source file: mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py
+Expected source size: 57770 bytes
+Expected source SHA256: 284cfa1e8829ec9d9893aec4f48768dca4b9c23a6b94281972418e78c68422e1
+
+GitHub backup file:
+mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py.gz
+
+Rebuild on macOS/Linux:
+gzip -dc mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py.gz > mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py
+shasum -a 256 mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py
+python3 -m py_compile mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py
+python3 mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py --self-test
