@@ -1,0 +1,365 @@
+--- mexc_spot_crossquote_flat_inventory_demo_v10_1_1.py
++++ mexc_spot_crossquote_flat_inventory_demo_v10_1_2.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ """
+-MEXC SPOT CROSS-QUOTE FLAT-INVENTORY DEMO V10.1.1
++MEXC SPOT CROSS-QUOTE FLAT-INVENTORY DEMO V10.1.2
+ ==================================================
+ DEMO ONLY - NEVER SENDS ORDERS.
+ 
+@@ -52,10 +52,10 @@
+ 
+ getcontext().prec = 34
+ 
+-VERSION = "10.1.1"
+-BOT_NAME = "MEXC SPOT CROSS-QUOTE FLAT-INVENTORY DEMO V10.1.1"
++VERSION = "10.1.2"
++BOT_NAME = "MEXC SPOT CROSS-QUOTE FLAT-INVENTORY DEMO V10.1.2"
+ BASE_URL = "https://api.mexc.com"
+-DEFAULT_STATE = "mexc_spot_crossquote_flat_inventory_demo_v10_1_1_state.json"
++DEFAULT_STATE = "mexc_spot_crossquote_flat_inventory_demo_v10_1_2_state.json"
+ 
+ D0 = Decimal("0")
+ D1 = Decimal("1")
+@@ -289,7 +289,10 @@
+         self.capital = dec(args.capital)
+         self.assets = [x.strip().upper() for x in args.assets.split(",") if x.strip()]
+         self.max_active = min(max(1, args.max_active), len(self.assets))
+-        self.sleeve_cap = self.capital / Decimal(self.max_active)
++        # V10.1.2 CAPITAL CONSERVATION: every configured asset owns one fixed sleeve.
++        # Sum of ALL sleeve capacities is exactly the portfolio capital, so rotating
++        # the active set can never create phantom capital.
++        self.sleeve_cap = self.capital / Decimal(len(self.assets))
+ 
+         self.maker_fee_bps = dec(args.maker_fee_bps)
+         self.taker_fee_bps = dec(args.taker_fee_bps)
+@@ -345,8 +348,14 @@
+         self.quote_preserved = 0
+         self.quote_cancelled = 0
+         self.no_fill_blackouts = 0
++        self.risk_order_trimmed = 0
++        self.risk_fill_trimmed = 0
++        self.hard_limit_breaches = 0
+         self.log_lines = 0
+ 
++        # Capital invariant must hold before any market data is touched.
++        self.assert_capital_invariant()
++
+     # ---------- API / market data ----------
+ 
+     def fetch_exchange_info(self) -> None:
+@@ -568,6 +577,57 @@
+         buy, _, _ = self.live_notional()
+         return self.base_inventory_value() + buy
+ 
++    def total_sleeve_capacity(self) -> Decimal:
++        return sum((st.sleeve_cap for st in self.stats.values()), D0)
++
++    def assert_capital_invariant(self) -> None:
++        total = self.total_sleeve_capacity()
++        tol = Decimal("0.00000001")
++        if abs(total - self.capital) > tol:
++            raise RuntimeError(
++                f"CAPITAL INVARIANT FAIL: sleeves={total} capital={self.capital}"
++            )
++
++    def pending_buy_risk_usdc(self, asset: str) -> Decimal:
++        return sum(
++            (self.pair_px_usdc(o.symbol, o.price) * o.remaining
++             for o in self.orders.values()
++             if o.asset == asset and o.side == "BUY" and o.remaining > 0),
++            D0,
++        )
++
++    def max_fill_qty_by_inventory(
++        self, asset: str, side: str, requested: Decimal, step: Decimal
++    ) -> Decimal:
++        """Clamp a fill so the fill itself cannot cross the 0.5%-5% hard band."""
++        if requested <= 0:
++            return D0
++        st = self.stats[asset]
++        unit_liq = self.liquidation_base_value(asset, Decimal("1"))
++        if unit_liq <= 0:
++            return D0
++        base_value = self.liquidation_base_value(asset, st.base_qty)
++        if side == "BUY":
++            room = max(D0, st.sleeve_cap * self.inv_hard_hi - base_value)
++        else:
++            room = max(D0, base_value - st.sleeve_cap * self.inv_hard_lo)
++        cap_qty = q_down(room / unit_liq, step)
++        return min(requested, max(D0, cap_qty))
++
++    def inventory_risk_status(self) -> Tuple[bool, Decimal]:
++        worst = D0
++        ok = True
++        for asset, st in self.stats.items():
++            if st.sleeve_cap <= 0:
++                continue
++            sh = self.base_share(asset)
++            worst = max(worst, sh)
++            # Market movement can move mark-to-market share marginally outside the
++            # band; new BUYs remain blocked. We count, rather than hide, the event.
++            if sh > self.inv_hard_hi + Decimal("0.0005"):
++                ok = False
++        return ok, worst
++
+     # ---------- initialization ----------
+ 
+     def select_active_assets(self) -> List[str]:
+@@ -730,8 +790,7 @@
+         now_ms = int(time.time() * 1000)
+         multipliers = [Decimal("1.0"), Decimal("1.5"), Decimal("2.0")]
+ 
+-        # Recompute reservations from the DESIRED book exactly once. Existing
+-        # preserved orders are included during this pass, so they are not double-counted.
++        # Shared spot-balance reservations across the whole desired book.
+         reserved_buy_usdc = D0
+         reserved_buy_usdt = D0
+         reserved_sell: Dict[str, Decimal] = collections.defaultdict(Decimal)
+@@ -743,10 +802,13 @@
+             base_value = self.liquidation_base_value(asset, st.base_qty)
+             hard_max_val = st.sleeve_cap * self.inv_hard_hi
+             hard_min_val = st.sleeve_cap * self.inv_hard_lo
+-            buy_capacity_usdc = max(D0, hard_max_val - base_value)
+-            sell_capacity_usdc = max(D0, base_value - hard_min_val)
+ 
+-            # Soft inventory band changes aggressiveness, not a global ON/OFF switch.
++            # V10.1.2: one shared risk budget across ALL BUY orders of the asset.
++            # It is decremented order by order, therefore USDC and USDT quotes cannot
++            # independently reserve the same remaining 5% inventory capacity.
++            buy_capacity_remaining = max(D0, hard_max_val - base_value)
++            sell_capacity_remaining = max(D0, base_value - hard_min_val)
++
+             buy_scale = Decimal("1")
+             sell_scale = Decimal("1")
+             if share >= self.inv_soft_hi:
+@@ -766,28 +828,29 @@
+                 quote = "USDC" if symbol.endswith("USDC") else "USDT"
+ 
+                 for side in ("BUY", "SELL"):
+-                    if not self.side_allowed(asset, side):
+-                        continue
+                     adverse = self.adverse_penalty_bps(asset, side)
+                     for level, mult in enumerate(multipliers, start=1):
+                         if side == "BUY":
++                            if buy_capacity_remaining <= 0:
++                                break
+                             px = b.bid - tick * Decimal(level - 1)
+                             raw_edge = (fair - px) / fair * BPS
+                             scale = buy_scale
++                            risk_room = buy_capacity_remaining
+                         else:
++                            if sell_capacity_remaining <= 0:
++                                break
+                             px = b.ask + tick * Decimal(level - 1)
+                             raw_edge = (px - fair) / fair * BPS
+                             scale = sell_scale
++                            risk_room = sell_capacity_remaining
++
+                         net_edge = raw_edge - self.maker_fee_bps - self.risk_buffer_bps - adverse
+                         required = self.min_edge_bps if level == 1 else self.full_edge_bps
+                         if net_edge < required:
+                             continue
+ 
+-                        lot_usdc = st.sleeve_cap * self.lot_fraction * mult * scale
+-                        if side == "BUY":
+-                            lot_usdc = min(lot_usdc, buy_capacity_usdc)
+-                        else:
+-                            lot_usdc = min(lot_usdc, sell_capacity_usdc)
++                        lot_usdc = min(st.sleeve_cap * self.lot_fraction * mult * scale, risk_room)
+                         if lot_usdc <= 0:
+                             continue
+ 
+@@ -798,7 +861,7 @@
+                         if qty <= 0 or (meta.min_qty > 0 and qty < meta.min_qty):
+                             continue
+ 
+-                        # Spot balance reservations.
++                        # Shared cash/base reservations.
+                         if side == "BUY":
+                             need_quote = px * qty
+                             if quote == "USDC":
+@@ -819,6 +882,12 @@
+ 
+                         if qty <= 0:
+                             continue
++                        notional_usdc = px_usdc * qty
++                        if side == "BUY":
++                            buy_capacity_remaining = max(D0, buy_capacity_remaining - notional_usdc)
++                        else:
++                            sell_capacity_remaining = max(D0, sell_capacity_remaining - notional_usdc)
++
+                         notional_quote = px * qty
+                         if meta.min_notional > 0 and notional_quote < meta.min_notional:
+                             continue
+@@ -826,22 +895,20 @@
+                         key = (symbol, side, level)
+                         old = self.orders.get(key)
+                         if old and old.price == px and old.remaining > 0:
+-                            self.quote_preserved += 1
+-                            out.append(old)
+-                            continue
++                            old_value = self.pair_px_usdc(old.symbol, old.price) * old.remaining
++                            # Preserve queue only when the old remaining quantity fits the
++                            # newly reserved risk budget. Otherwise refresh_quotes replaces it.
++                            if old.remaining <= qty:
++                                self.quote_preserved += 1
++                                out.append(old)
++                                continue
++                            self.risk_order_trimmed += 1
+ 
+                         q_ahead = self.queue_ahead_for(symbol, side, px)
+                         out.append(
+                             VirtualOrder(
+-                                oid=self.next_oid,
+-                                symbol=symbol,
+-                                asset=asset,
+-                                quote=quote,
+-                                side=side,
+-                                level=level,
+-                                price=px,
+-                                qty=qty,
+-                                remaining=qty,
++                                oid=self.next_oid, symbol=symbol, asset=asset, quote=quote,
++                                side=side, level=level, price=px, qty=qty, remaining=qty,
+                                 created_ms=now_ms,
+                                 eligible_ms=now_ms + int(self.args.min_life * 1000),
+                                 queue_ahead=q_ahead,
+@@ -860,13 +927,19 @@
+ 
+         for key, want in desired_map.items():
+             old = self.orders.get(key)
+-            if old and old.remaining > 0 and old.price == want.price:
+-                new_orders[key] = old
+-                continue
+-            if old and old.remaining > 0 and now_ms - old.created_ms < int(self.args.min_life * 1000):
++            if old and old.remaining > 0 and old.price == want.price and old.remaining <= want.remaining:
+                 new_orders[key] = old
+                 continue
+             if old and old.remaining > 0:
++                age_s = (now_ms - old.created_ms) / 1000.0
++                drift_bps = abs(want.price / old.price - Decimal("1")) * BPS if old.price > 0 else Decimal("999")
++                # V10.1.2 anti-churn: retain queue unless BOTH age and material
++                # price-drift thresholds are satisfied. Risk-size trims bypass this.
++                risk_trim = old.remaining > want.remaining
++                if not risk_trim and (age_s < self.args.reprice_min_age or drift_bps < dec(self.args.reprice_min_bps)):
++                    new_orders[key] = old
++                    self.quote_preserved += 1
++                    continue
+                 self.quote_repriced += 1
+             else:
+                 self.quote_created += 1
+@@ -875,8 +948,10 @@
+         for key, old in self.orders.items():
+             if key in new_orders or old.remaining <= 0:
+                 continue
+-            if now_ms - old.created_ms < int(self.args.min_life * 1000):
++            age_s = (now_ms - old.created_ms) / 1000.0
++            if age_s < max(self.args.min_life, self.args.cancel_min_age):
+                 new_orders[key] = old
++                self.quote_preserved += 1
+             else:
+                 self.quote_cancelled += 1
+ 
+@@ -977,6 +1052,13 @@
+ 
+     def execute_virtual_fill(self, o: VirtualOrder, qty: Decimal, t_ms: int) -> None:
+         st = self.stats[o.asset]
++        meta = self.meta.get(o.symbol, SymbolMeta(o.symbol))
++        requested_qty = qty
++        qty = self.max_fill_qty_by_inventory(o.asset, o.side, qty, meta.step)
++        if qty < requested_qty:
++            self.risk_fill_trimmed += 1
++        if qty <= 0:
++            return
+         quote_notional = o.price * qty
+         px_usdc = self.pair_px_usdc(o.symbol, o.price)
+         notional_usdc = px_usdc * qty
+@@ -1127,6 +1209,7 @@
+             f"{utc_text()} | STATUS | EQ={fnum(eq,4)} ALPHA={fnum(a,4)} "
+             f"LIVE={fnum(live,2)} IMPEGNATO={fnum(engaged,2)} "
+             f"MATCH={fnum(self.total_matched(),2)} CICLI={self.total_cycles()} "
++            f"CAPINV={'OK' if abs(self.total_sleeve_capacity()-self.capital) <= Decimal('0.00000001') else 'FAIL'} "
+             f"API={api} 403/429={self.rest.waf_events} timeout={self.rest.timeout_events}"
+         )
+ 
+@@ -1170,8 +1253,14 @@
+             lines.append(f"  Markout 30s cumulativo                      : {fnum(markout,6)} USDC")
+             lines.append(f"  Fee maker simulate                          : {fnum(fees,6)} USDC")
+             lines.append("-" * 150)
+-            lines.append("CAPITALE — NON confonde assegnato con realmente impegnato")
+-            lines.append(f"  Capitale sleeve assegnato                   : {fnum(self.sleeve_cap*self.max_active,2)} USDC | {self.max_active} asset ACTIVE")
++            lines.append("CAPITALE — CONSERVAZIONE ESATTA, NIENTE PHANTOM CAPITAL")
++            total_sleeves = self.total_sleeve_capacity()
++            active_cap = sum((st.sleeve_cap for st in self.stats.values() if st.active), D0)
++            reserve_cap = total_sleeves - active_cap
++            cap_ok = abs(total_sleeves - self.capital) <= Decimal("0.00000001")
++            lines.append(f"  Capitale TOTALE contabilizzato               : {fnum(total_sleeves,2)} USDC | invariant {'OK' if cap_ok else 'FAIL'}")
++            lines.append(f"  Capitale sleeve ACTIVE                       : {fnum(active_cap,2)} USDC | {sum(1 for st in self.stats.values() if st.active)} asset")
++            lines.append(f"  Riserva sleeve non attiva                    : {fnum(reserve_cap,2)} USDC")
+             lines.append(f"  Inventory volatile mark-to-market           : {fnum(inv,2)} USDC | {float(inv/self.capital*100):.2f}% del capitale")
+             lines.append(f"  Ordini BUY vivi / SELL vivi                 : {fnum(buy_live,2)} / {fnum(sell_live,2)} USDC")
+             lines.append(f"  Notional ordini vivi totale                 : {fnum(live,2)} USDC")
+@@ -1216,6 +1305,12 @@
+             lines.append(f"  API resume conservativi                     : {self.api_resume_count} | blackout senza retro-fill {self.no_fill_blackouts}")
+             lines.append(f"  Tape saturo >=1000                          : {self.tape_saturated}")
+             lines.append(f"  Quote create/reprice/preserve/cancel        : {self.quote_created}/{self.quote_repriced}/{self.quote_preserved}/{self.quote_cancelled}")
++            lines.append(f"  Risk trim ordini / fill                     : {self.risk_order_trimmed} / {self.risk_fill_trimmed}")
++            inv_ok, worst_share = self.inventory_risk_status()
++            if not inv_ok:
++                self.hard_limit_breaches += 1
++            lines.append(f"  Inventory hard runtime                      : {'OK' if inv_ok else 'BREACH-MARK'} | worst {float(worst_share*100):.3f}% | eventi {self.hard_limit_breaches}")
++            lines.append(f"  Anti-churn reprice                          : min_age {self.args.reprice_min_age:.0f}s | min_drift {self.args.reprice_min_bps:.2f}bp | cancel_age {self.args.cancel_min_age:.0f}s")
+             lines.append(f"  Participation massima                       : {float(self.participation*100):.1f}% | min life {self.args.min_life:.0f}s")
+             lines.append("-" * 150)
+             lines.append("REGOLE CHIAVE")
+@@ -1296,7 +1391,8 @@
+         print()
+         print(BOT_NAME + " — NESSUN ORDINE REALE")
+         print(
+-            f"Capitale={self.capital} | assets={','.join(self.assets)} | max_active={self.max_active}"
++            f"Capitale={self.capital} | assets={','.join(self.assets)} | max_active={self.max_active} | "
++            f"sleeve_fixed={fnum(self.sleeve_cap,2)} | total_sleeves={fnum(self.total_sleeve_capacity(),2)}"
+         )
+         print(
+             f"Fee simulate maker/taker={self.maker_fee_bps}/{self.taker_fee_bps} bp | "
+@@ -1400,8 +1496,26 @@
+     assert "/api/v3/depth" in src
+     assert "/api/v3/aggTrades" in src
+ 
++    # V10.1.2 invariants: six configured sleeves can never sum above capital.
++    cap = Decimal("10000")
++    assets = ["BTC", "ETH", "SOL", "XRP", "BCH", "DOGE"]
++    sleeve = cap / Decimal(len(assets))
++    assert abs(sleeve * Decimal(len(assets)) - cap) < Decimal("1e-20")
++    assert sleeve * Decimal("5") < cap
++    assert "CAPITAL CONSERVATION" in src
++    assert "max_fill_qty_by_inventory" in src
++    assert "buy_capacity_remaining" in src
++    assert "reprice_min_age" in src
++
++    # Pure hard-band arithmetic: a fill request larger than residual room must trim.
++    hard_hi = Decimal("0.050")
++    current = sleeve * Decimal("0.049")
++    room = sleeve * hard_hi - current
++    requested = sleeve * Decimal("0.010")
++    assert room > 0 and room < requested
++
+     print(f"SELF-TEST {BOT_NAME}: SUPERATO")
+-    print("  OK UTC | OK no-real-order path | OK serialized REST | OK preserve-on-blackout design")
++    print("  OK UTC | OK no-real-order | OK capital invariant | OK hard-fill clamp | OK anti-churn | OK blackout preserve")
+ 
+ 
+ def build_parser() -> argparse.ArgumentParser:
+@@ -1420,6 +1534,9 @@
+     p.add_argument("--lot-fraction", type=float, default=0.0125)
+     p.add_argument("--participation", type=float, default=0.35)
+     p.add_argument("--min-life", type=float, default=30.0)
++    p.add_argument("--reprice-min-age", type=float, default=90.0)
++    p.add_argument("--reprice-min-bps", type=float, default=0.50)
++    p.add_argument("--cancel-min-age", type=float, default=60.0)
+     p.add_argument("--poll", type=float, default=2.0)
+     p.add_argument("--quote-refresh", type=float, default=10.0)
+     p.add_argument("--depth-ttl", type=float, default=45.0)
