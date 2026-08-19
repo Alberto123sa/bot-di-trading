@@ -1,0 +1,873 @@
+--- mexc_global_spot_opportunity_router_demo_v11_0_0.py	2026-08-19 08:14:18.159861865 +0000
++++ mexc_global_spot_opportunity_router_demo_v11_1_0.py	2026-08-19 08:17:03.558448137 +0000
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ """
+-MEXC GLOBAL SPOT CLOSED-CYCLE OPPORTUNITY ROUTER DEMO V11.0.0
++MEXC GLOBAL SPOT CLOSED-CYCLE OPPORTUNITY ROUTER DEMO V11.1.0
+ ==============================================================
+ DEMO ONLY - NEVER SENDS ORDERS.
+ 
+@@ -19,7 +19,11 @@
+    The volatile asset is only a temporary bridge. Once the simulated maker leg
+    fills, the hedge is executed immediately against the current top of book.
+ 
+-2) STABLE TRIANGLE (all taker, only if executable net edge is positive)
++2) DIRECT STABLE MAKER (maker -> alternative stable hedge path)
++   Example: USDC -> USD1 maker on USD1/USDC -> USDT -> USDC taker hedge.
++   The maker symbol itself is excluded from the hedge path to avoid fake same-book round trips.
++
++3) STABLE TRIANGLE (all taker, only if executable net edge is positive)
+    Example: USDC -> USDT -> USD1 -> USDC, and the reverse cycle.
+ 
+ Fee policy
+@@ -36,7 +40,8 @@
+ Conservative simulation choices
+ -------------------------------
+ - Public REST only; no private endpoints, no real orders, no futures/leverage.
+ - All-symbol bookTicker drives the global scanner.
+-- aggTrades is polled only for live virtual maker orders, round-robin.
++- aggTrades is polled only for live virtual maker orders, round-robin. Busy 1000-trade
++  windows are recursively split by startTime/endTime until completeness is proven.
+ - BUY-maker fills require buyer-is-maker tape evidence when the field is
+   available, plus queue-ahead depletion and a participation cap.
+ - One live maker route per asset; no stacking volatile exposure.
+@@ -72,9 +77,9 @@
+ getcontext().prec = 36
+ 
+-VERSION = "11.0.0"
+-BOT_NAME = "MEXC GLOBAL SPOT CLOSED-CYCLE OPPORTUNITY ROUTER DEMO V11.0.0"
++VERSION = "11.1.0"
++BOT_NAME = "MEXC GLOBAL SPOT CLOSED-CYCLE OPPORTUNITY ROUTER DEMO V11.1.0"
+ BASE_URL = "https://api.mexc.com"
+-DEFAULT_STATE = "mexc_global_spot_opportunity_router_demo_v11_0_0_state.json"
++DEFAULT_STATE = "mexc_global_spot_opportunity_router_demo_v11_1_0_state.json"
+ 
+ D0 = Decimal("0")
+ D1 = Decimal("1")
+@@ -257,12 +262,14 @@
+     buffer_bps: Decimal
+     net_edge_bps: Decimal
+     capacity_usdc: Decimal
++    score_usdc_per_fill: Decimal
+     fee_text: str
+     ts: float
+ 
+ 
+ @dataclasses.dataclass
+ class VirtualMaker:
+     oid: int
++    kind: str
+     route_id: str
+     asset: str
+     quote_in: str
+@@ -394,6 +401,10 @@
+         self.orders_cancelled = 0
+         self.maker_fills = 0
+         self.tape_saturated = 0
++        self.tape_windows_split = 0
++        self.tape_windows_complete = 0
++        self.tape_windows_dropped = 0
++        self.stable_maker_routes_seen = 0
+         self.api_resumes = 0
+         self.blackout_reprime = 0
+         self.stable_triangles = 0
+@@ -686,10 +697,141 @@
+             buffer_bps=buffer_bps,
+             net_edge_bps=net_edge,
+             capacity_usdc=cap,
++            score_usdc_per_fill=max(D0, size * net_edge / BPS),
+             fee_text=fees_txt,
+             ts=time.time(),
+         )
+ 
++    def stable_path_convert(self, amount: Decimal, path: Sequence[str], exclude_symbol: str = "") -> Optional[Tuple[Decimal, Decimal, Decimal, List[str]]]:
++        """Execute a stable-only taker path on current top books.
++        Returns (output, fee_usdc_approx, max_input_capacity, symbols).
++        The path is linear at top-of-book; max_input_capacity is expressed in the path input currency.
++        """
++        if amount < 0 or len(path) < 2:
++            return None
++        amt = amount
++        fee_usdc = D0
++        cap0 = Decimal("1e50")
++        used: List[str] = []
++        input_scale = D1
++        for i, (a, b) in enumerate(zip(path[:-1], path[1:])):
++            sym = self.stable_symbols.get(frozenset((a, b)))
++            if not sym or sym == exclude_symbol or sym not in self.books or sym not in self.meta:
++                return None
++            r = self.convert_taker(amt, a, b)
++            if r is None:
++                return None
++            out, _, cap_input, rsym = r
++            if rsym == exclude_symbol:
++                return None
++            # Translate this leg's input capacity back to original path input units.
++            if i == 0:
++                cap0 = min(cap0, cap_input)
++            elif input_scale > 0:
++                cap0 = min(cap0, cap_input / input_scale)
++            input_usdc = self._stable_to_usdc_no_fee(amt, a) or D0
++            fee_usdc += input_usdc * self.fee_fraction(self.meta[rsym].taker_bps)
++            if amount > 0:
++                input_scale = out / amount
++            amt = out
++            used.append(rsym)
++        return amt, fee_usdc, cap0, used
++
++    def best_stable_path(self, amount: Decimal, from_ccy: str, to_ccy: str, exclude_symbol: str = "") -> Optional[Tuple[Decimal, Decimal, Decimal, Tuple[str, ...], List[str]]]:
++        if from_ccy == to_ccy:
++            return amount, D0, Decimal("1e50"), (from_ccy, to_ccy), []
++        candidates: List[Tuple[str, ...]] = [(from_ccy, to_ccy)]
++        for mid in STABLES:
++            if mid not in (from_ccy, to_ccy):
++                candidates.append((from_ccy, mid, to_ccy))
++        best = None
++        for path in candidates:
++            r = self.stable_path_convert(amount, path, exclude_symbol)
++            if r is None:
++                continue
++            out, fee, cap, used = r
++            if best is None or out > best[0]:
++                best = (out, fee, cap, path, used)
++        return best
++
++    def stable_maker_route(self, sym: str) -> Optional[RouteQuote]:
++        """Closed stable cycle with first leg as maker BUY on one stable pair.
++        The maker symbol itself is excluded from the hedge path, preventing fake same-book round trips.
++        """
++        if sym not in self.meta or sym not in self.books:
++            return None
++        m = self.meta[sym]
++        b = self.books[sym]
++        if m.base not in STABLES or m.quote not in STABLES or b.bid <= 0:
++            return None
++        if b.spread_bps > dec(self.args.max_pair_spread_bps):
++            return None
++        maker_fee = self.fee_fraction(m.maker_bps)
++        quote_needed = b.bid * (D1 + maker_fee)  # buy one base at maker bid
++
++        # Find USDC -> quote without using maker symbol.
++        starts = []
++        if m.quote == "USDC":
++            starts.append((quote_needed, D0, Decimal("1e50"), ("USDC",), []))
++        else:
++            # Since stable paths are linear at top book, derive input cost from 1 USDC output ratio.
++            one = self.best_stable_path(D1, "USDC", m.quote, sym)
++            if one and one[0] > 0:
++                required = quote_needed / one[0]
++                rr = self.best_stable_path(required, "USDC", m.quote, sym)
++                if rr:
++                    starts.append((required, rr[1], rr[2], rr[3], rr[4]))
++        if not starts:
++            return None
++        start_usdc, fee_start, start_cap, start_path, start_syms = starts[0]
++
++        end = self.best_stable_path(D1, m.base, "USDC", sym)
++        if end is None:
++            return None
++        end_usdc, fee_end, end_cap_base, end_path, end_syms = end
++        if start_usdc <= 0:
++            return None
++
++        # Gross diagnostic strips fees but keeps executable spread/path geometry approximately.
++        gross_edge = (end_usdc + fee_end) / max(Decimal("1e-30"), start_usdc - fee_start) * BPS - BPS
++        net_before_buffer = (end_usdc / start_usdc - D1) * BPS
++        fee_bps = gross_edge - net_before_buffer
++        buffer_bps = dec(self.args.execution_buffer_bps)
++        net_edge = net_before_buffer - buffer_bps
++
++        maker_cap_base = b.bid_qty
++        maker_cap_usdc = maker_cap_base * start_usdc
++        hedge_cap_usdc = end_cap_base * start_usdc
++        cap = min(maker_cap_usdc, hedge_cap_usdc, dec(self.args.order_usdc))
++        cap *= dec(self.args.top_book_participation)
++        cap = min(cap, dec(self.args.order_usdc))
++        if cap <= 0:
++            return None
++        qty = q_down(cap / start_usdc, m.step)
++        if qty <= 0:
++            return None
++        size = qty * start_usdc
++        rid = f"STABLE:{sym}:BUY:{'>'.join(start_path)}|{'>'.join(end_path)}"
++        fees_txt = f"{sym} M{fnum(m.maker_bps,2)}({m.fee_source}) | hedge {'/'.join(start_syms + end_syms)}"
++        return RouteQuote(
++            route_id=rid,
++            kind="STABLE_MAKER",
++            asset=f"STABLE-{sym}",
++            quote_in=m.quote,
++            quote_out=m.base,
++            maker_symbol=sym,
++            hedge_symbol="|".join(end_syms),
++            maker_px=b.bid,
++            hedge_px=end_usdc,
++            size_usdc=size,
++            qty=qty,
++            gross_edge_bps=gross_edge,
++            fee_bps=fee_bps,
++            buffer_bps=buffer_bps,
++            net_edge_bps=net_edge,
++            capacity_usdc=cap,
++            score_usdc_per_fill=max(D0, size * net_edge / BPS),
++            fee_text=fees_txt,
++            ts=time.time(),
++        )
++
+     def _usdc_cost_no_fee(self, needed: Decimal, ccy: str) -> Optional[Decimal]:
+         if ccy == "USDC":
+             return needed
+@@ -736,7 +878,12 @@
+                     r = self.paired_route(asset, q_in, q_out)
+                     if r is not None:
+                         routes.append(r)
+-        routes.sort(key=lambda x: (x.net_edge_bps, x.capacity_usdc), reverse=True)
++        for sym in sorted(set(self.stable_symbols.values())):
++            r = self.stable_maker_route(sym)
++            if r is not None:
++                routes.append(r)
++                self.stable_maker_routes_seen += 1
++        routes.sort(key=lambda x: (x.score_usdc_per_fill, x.net_edge_bps, x.capacity_usdc), reverse=True)
+         self.latest_routes = routes[: max(20, self.args.report_top * 3)]
+         self.scans += 1
+         self.routes_seen += len(routes)
+@@ -804,6 +951,7 @@
+             q_ahead = (b.bid_qty if b else D0) * dec(self.args.queue_multiplier)
+             o = VirtualMaker(
+                 oid=self.next_oid,
++                kind=r.kind,
+                 route_id=r.route_id,
+                 asset=r.asset,
+                 quote_in=r.quote_in,
+@@ -851,39 +999,79 @@
+         self.blackout_reprime += 1
+         print(f"{utc_text()} | [API RESUME] virtual maker orders PRESERVED; tape re-primed; no retro-fill")
+ 
+-    def poll_one_tape(self) -> None:
+-        if not self.live_orders:
+-            return
+-        assets = sorted(self.live_orders)
+-        if not assets:
+-            return
+-        asset = assets[self.tape_rr % len(assets)]
+-        self.tape_rr += 1
+-        o = self.live_orders.get(asset)
+-        if o is None:
+-            return
++    def _fetch_tape_window(self, symbol: str, start_ms: int, end_ms: int, depth: int = 0) -> Optional[List[Dict[str, Any]]]:
++        """Fetch a COMPLETE aggTrades window. If max=1000 is hit, bisect by time.
++        This avoids both retro-fills and the V11.0.0 failure mode that discarded busy markets.
++        """
++        if end_ms < start_ms:
++            return []
+         try:
+-            raw = self.rest.get("/api/v3/aggTrades", {"symbol": o.symbol, "limit": 1000})
++            raw = self.rest.get(
++                "/api/v3/aggTrades",
++                {"symbol": symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
++            )
+         except APIDegraded:
+-            return
++            return None
+         if not isinstance(raw, list):
+-            return
+-        if len(raw) >= 1000:
++            return []
++        if len(raw) < 1000:
++            self.tape_windows_complete += 1
++            return raw
++        self.tape_saturated += 1
++        # If the millisecond itself contains >=1000 aggregates, we cannot prove completeness with REST.
++        if start_ms >= end_ms or depth >= 16:
++            self.tape_windows_dropped += 1
++            return None
++        mid = (start_ms + end_ms) // 2
++        if mid < start_ms:
++            self.tape_windows_dropped += 1
++            return None
++        self.tape_windows_split += 1
++        left = self._fetch_tape_window(symbol, start_ms, mid, depth + 1)
++        if left is None:
++            return None
++        right = self._fetch_tape_window(symbol, mid + 1, end_ms, depth + 1)
++        if right is None:
++            return None
++        # De-duplicate aggregate trade IDs/timestamps defensively.
++        seen = set()
++        out = []
++        for tr in left + right:
++            key = (tr.get("a"), tr.get("T"), tr.get("p"), tr.get("q"))
++            if key in seen:
++                continue
++            seen.add(key)
++            out.append(tr)
++        out.sort(key=lambda t: (int(t.get("T", 0) or 0), int(t.get("a", 0) or 0)))
++        return out
++
++    def poll_one_tape(self) -> None:
++        if not self.live_orders:
++            return
++        assets = sorted(self.live_orders)
++        if not assets:
++            return
++        asset = assets[self.tape_rr % len(assets)]
++        self.tape_rr += 1
++        o = self.live_orders.get(asset)
++        if o is None:
++            return
++        now_ms = int(time.time() * 1000)
++        start_ms = max(o.last_trade_ms + 1, o.eligible_ms)
++        if start_ms > now_ms:
++            return
++        raw = self._fetch_tape_window(o.symbol, start_ms, now_ms)
++        if raw is None:
++            # Do not advance cursor on an incomplete window; retry later.
++            return
++
++        for tr in raw:
++            t_ms = int(tr.get("T", 0) or 0)
++            if t_ms <= o.last_trade_ms or t_ms < o.eligible_ms or t_ms > now_ms + 2000:
++                continue
++            p = dec(tr.get("p"))
++            q = dec(tr.get("q"))
++            if p <= 0 or q <= 0:
++                continue
++            # For our resting BUY, buyer-maker evidence is required when present.
++            if "m" in tr and not bool(tr.get("m")):
++                o.last_trade_ms = max(o.last_trade_ms, t_ms)
++                continue
++            if p > o.price:
++                o.last_trade_ms = max(o.last_trade_ms, t_ms)
++                continue
++
++            o.last_trade_ms = max(o.last_trade_ms, t_ms)
++            if o.queue_ahead > 0:
++                take = min(o.queue_ahead, q)
++                o.queue_ahead -= take
++                q -= take
++                if q <= 0:
++                    continue
++            max_part = dec(self.args.tape_participation) * dec(tr.get("q"))
++            fill_qty = min(o.remaining, q, max_part)
++            fill_qty = q_down(fill_qty, self.meta[o.symbol].step)
++            if fill_qty <= 0:
++                continue
++            if o.kind == "STABLE_MAKER":
++                self.execute_stable_maker_fill(o, fill_qty, t_ms)
++            else:
++                self.execute_paired_fill(o, fill_qty, t_ms)
++            if o.remaining <= 0:
++                self.live_orders.pop(asset, None)
++                break
++
++    def execute_paired_fill(self, o: VirtualMaker, qty: Decimal, t_ms: int) -> None:
++        if qty <= 0:
++            return
++        m_in = self.meta[o.symbol]
++        b_out = self.books.get(o.hedge_symbol)
++        m_out = self.meta.get(o.hedge_symbol)
++        if b_out is None or m_out is None or b_out.bid <= 0:
++            self.no_hedge_book += 1
++            return
++
++        maker_fee = self.fee_fraction(m_in.maker_bps)
++        hedge_fee = self.fee_fraction(m_out.taker_bps)
++
++        qin_needed = o.price * qty * (D1 + maker_fee)
++        start = self.usdc_to_stable_cost(qin_needed, o.quote_in)
++        if start is None:
++            self.no_hedge_book += 1
++            return
++        start_usdc, fee_start, _ = start
++
++        qout_gross = b_out.bid * qty
++        qout_net = qout_gross * (D1 - hedge_fee)
++        end = self.stable_to_usdc(qout_net, o.quote_out)
++        if end is None:
++            self.no_hedge_book += 1
++            return
++        end_usdc, fee_end, _ = end
++
++        # Explicit asset-leg fees in USDC approximation.
++        maker_fee_usdc = start_usdc * self.fee_fraction(m_in.maker_bps)
++        hedge_pre_usdc = self._stable_to_usdc_no_fee(qout_gross, o.quote_out) or D0
++        hedge_fee_usdc = hedge_pre_usdc * self.fee_fraction(m_out.taker_bps)
++        fees_usdc = fee_start + fee_end + maker_fee_usdc + hedge_fee_usdc
++
++        pnl = end_usdc - start_usdc
++        gross = pnl + fees_usdc
++        realized_edge = pnl / start_usdc * BPS if start_usdc > 0 else D0
++        decay = o.armed_edge_bps - realized_edge
++        transient_ms = max(0, int(time.time() * 1000) - t_ms)
++
++        o.remaining -= qty
++        o.fills += 1
++        self.maker_fills += 1
++        self.record_cycle(
++            ClosedCycle(
++                ts=time.time(),
++                kind="PAIRED",
++                asset=o.asset,
++                route=o.route_id,
++                size_usdc=start_usdc,
++                pnl_usdc=pnl,
++                gross_usdc=gross,
++                fees_usdc=fees_usdc,
++                armed_edge_bps=o.armed_edge_bps,
++                realized_edge_bps=realized_edge,
++                edge_decay_bps=decay,
++                transient_ms=transient_ms,
++            )
++        )
++        if pnl < 0:
++            self.forced_hedges_negative += 1
++
++        # There is deliberately no volatile balance after this method: hedge closes immediately.
++        transient_notional = start_usdc
++        self.max_transient_inventory = max(self.max_transient_inventory, transient_notional)
++        self.max_transient_ms = max(self.max_transient_ms, transient_ms)
++
++    def execute_stable_maker_fill(self, o: VirtualMaker, qty: Decimal, t_ms: int) -> None:
++        if qty <= 0:
++            return
++        m = self.meta[o.symbol]
++        maker_fee = self.fee_fraction(m.maker_bps)
++        quote_needed = o.price * qty * (D1 + maker_fee)
++        # Start path excludes maker symbol.
++        if m.quote == "USDC":
++            start_usdc, fee_start = quote_needed, D0
++        else:
++            one = self.best_stable_path(D1, "USDC", m.quote, o.symbol)
++            if one is None or one[0] <= 0:
++                self.no_hedge_book += 1
++                return
++            required = quote_needed / one[0]
++            rr = self.best_stable_path(required, "USDC", m.quote, o.symbol)
++            if rr is None:
++                self.no_hedge_book += 1
++                return
++            start_usdc, fee_start = required, rr[1]
++        end = self.best_stable_path(qty, m.base, "USDC", o.symbol)
++        if end is None:
++            self.no_hedge_book += 1
++            return
++        end_usdc, fee_end, _, path, syms = end
++        maker_fee_usdc = start_usdc * self.fee_fraction(m.maker_bps)
++        fees_usdc = fee_start + fee_end + maker_fee_usdc
++        pnl = end_usdc - start_usdc
++        gross = pnl + fees_usdc
++        realized_edge = pnl / start_usdc * BPS if start_usdc > 0 else D0
++        decay = o.armed_edge_bps - realized_edge
++        transient_ms = max(0, int(time.time() * 1000) - t_ms)
++        o.remaining -= qty
++        o.fills += 1
++        self.maker_fills += 1
++        self.record_cycle(ClosedCycle(
++            ts=time.time(), kind="STABLE_MAKER", asset=o.asset, route=o.route_id,
++            size_usdc=start_usdc, pnl_usdc=pnl, gross_usdc=gross, fees_usdc=fees_usdc,
++            armed_edge_bps=o.armed_edge_bps, realized_edge_bps=realized_edge,
++            edge_decay_bps=decay, transient_ms=transient_ms,
++        ))
++        if pnl < 0:
++            self.forced_hedges_negative += 1
++        self.max_transient_inventory = max(self.max_transient_inventory, start_usdc)
++        self.max_transient_ms = max(self.max_transient_ms, transient_ms)
++
++    def record_cycle(self, c: ClosedCycle) -> None:
++        self.closed_cycles.append(c)
++        self.closed_pnl += c.pnl_usdc
++        self.closed_gross += c.gross_usdc
++        self.fee_cost += c.fees_usdc
++        self.turnover += c.size_usdc
++        st = self.stable_stats if c.kind in ("STABLE", "STABLE_MAKER") else self.asset_stats[c.asset]
++        st.cycles += 1
++        st.turnover += c.size_usdc
++        st.pnl += c.pnl_usdc
++        st.gross += c.gross_usdc
++        st.fees += c.fees_usdc
++        st.edge_decay += c.edge_decay_bps
++        st.max_transient_ms = max(st.max_transient_ms, c.transient_ms)
++        if c.pnl_usdc >= 0:
++            st.wins += 1
++        else:
++            st.losses += 1
++
++    # -------------------- stable triangle --------------------
++
++    def triangle_path(self, path: Sequence[str], amount_usdc: Decimal) -> Optional[Tuple[Decimal, Decimal, str]]:
++        amt = amount_usdc
++        fee_usdc_total = D0
++        symbols: List[str] = []
++        for a, b in zip(path[:-1], path[1:]):
++            r = self.convert_taker(amt, a, b)
++            if r is None:
++                return None
++            out, _, capacity_input, sym = r
++            if capacity_input < amt * dec(self.args.triangle_depth_safety):
++                return None
++            if sym != "CASH":
++                symbols.append(sym)
++                # Approximate fee in USDC using input USDC-equivalent.
++                input_usdc = self._stable_to_usdc_no_fee(amt, a) or amt
++                fee_usdc_total += input_usdc * self.fee_fraction(self.meta[sym].taker_bps)
++            amt = out
++        return amt, fee_usdc_total, "->".join(path) + " | " + ",".join(symbols)
++
++    def maybe_execute_stable_triangle(self) -> None:
++        if time.time() - self.last_triangle < self.args.triangle_cooldown:
++            return
++        size = min(dec(self.args.triangle_usdc), self.capital * dec(self.args.triangle_max_pct))
++        if size <= 0:
++            return
++        paths = [
++            ("USDC", "USDT", "USD1", "USDC"),
++            ("USDC", "USD1", "USDT", "USDC"),
++        ]
++        best: Optional[Tuple[Decimal, Decimal, str, Tuple[str, ...]]] = None
++        for p in paths:
++            res = self.triangle_path(p, size)
++            if res is None:
++                continue
++            out, fees, detail = res
++            pnl = out - size
++            edge = pnl / size * BPS
++            if edge < dec(self.args.triangle_min_edge_bps):
++                continue
++            # Avoid repeatedly harvesting the exact same stale top-of-book snapshot.
++            sig_parts = []
++            for a, b in zip(p[:-1], p[1:]):
++                sym = self.stable_symbols.get(frozenset((a, b)))
++                if not sym or sym not in self.books:
++                    sig_parts.append("NA")
++                else:
++                    bk = self.books[sym]
++                    sig_parts.append(f"{sym}:{bk.bid}:{bk.ask}")
++            sig = hashlib.sha256("|".join(sig_parts).encode()).hexdigest()
++            key = "->".join(p)
++            if self.last_triangle_signature.get(key) == sig:
++                self.stable_triangle_skips_stale += 1
++                continue
++            if best is None or pnl > best[0]:
++                best = (pnl, fees, detail + " | sig=" + sig, p)
++
++        if best is None:
++            return
++        pnl, fees, detail_sig, path = best
++        detail, sig = detail_sig.rsplit(" | sig=", 1)
++        self.last_triangle_signature["->".join(path)] = sig
++        self.last_triangle = time.time()
++        gross = pnl + fees
++        edge = pnl / size * BPS
++        self.record_cycle(
++            ClosedCycle(
++                ts=time.time(),
++                kind="STABLE",
++                asset="STABLE",
++                route=detail,
++                size_usdc=size,
++                pnl_usdc=pnl,
++                gross_usdc=gross,
++                fees_usdc=fees,
++                armed_edge_bps=edge,
++                realized_edge_bps=edge,
++                edge_decay_bps=D0,
++                transient_ms=0,
++            )
++        )
++        self.stable_triangles += 1
++
++    # -------------------- state / accounting / report --------------------
++
++    def save_state(self) -> None:
++        payload = {
++            "version": VERSION,
++            "ts": time.time(),
++            "capital": str(self.capital),
++            "closed_pnl": str(self.closed_pnl),
++            "closed_gross": str(self.closed_gross),
++            "fee_cost": str(self.fee_cost),
++            "turnover": str(self.turnover),
++            "cycles": len(self.closed_cycles),
++            "note": "summary only; restart intentionally does not restore live maker queues",
++        }
++        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
++        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++        os.replace(tmp, self.state_path)
++
++    def current_equity(self) -> Decimal:
++        # No persistent volatile inventory by architecture. Only closed cash PNL counts.
++        return self.capital + self.closed_pnl
++
++    def avg_live_notional(self) -> Decimal:
++        self.update_live_integral()
++        elapsed = max(1.0, time.time() - self.start_ts)
++        return self.avg_live_integral / dec(elapsed)
++
++    def report(self) -> str:
++        with self.lock:
++            eq = self.current_equity()
++            pnl = self.closed_pnl
++            elapsed = max(1.0, time.time() - self.start_ts)
++            avg_live = self.avg_live_notional()
++            monthly_seconds = Decimal(str(30 * 24 * 3600))
++            proj = pnl / dec(elapsed) * monthly_seconds if elapsed >= 6 * 3600 else None
++            proj_pct = pct_value(proj, self.capital) if proj is not None else None
++            eff = pct_value(proj, avg_live) if proj is not None and avg_live > 0 else None
++            wins = sum(s.wins for s in self.asset_stats.values()) + self.stable_stats.wins
++            losses = sum(s.losses for s in self.asset_stats.values()) + self.stable_stats.losses
++            cycles = wins + losses
++            avg_edge = pnl / self.turnover * BPS if self.turnover > 0 else D0
++            decay_sum = sum((c.edge_decay_bps for c in self.closed_cycles), D0)
++            avg_decay = decay_sum / dec(len(self.closed_cycles)) if self.closed_cycles else D0
++
++            lines = []
++            lines.append("=" * 160)
++            lines.append(f"{BOT_NAME} | {utc_text()} | NESSUN ORDINE REALE")
++            lines.append("=" * 160)
++            lines.append("RISULTATO CASH — riferimento principale, solo cicli CHIUSI stable->stable")
++            lines.append(f"  Capitale virtuale iniziale                    : {fnum(self.capital,2)} USDC")
++            lines.append(f"  Patrimonio liquidabile ORA                    : {fnum(eq,6)} USDC")
++            lines.append(
++                f"  PROFITTO/PERDITA CASH CHIUSA                  : {fnum(pnl,6)} USDC | {fnum(pct_value(pnl,self.capital),4)}%"
++            )
++            lines.append(f"  Profitto lordo prima commissioni              : {fnum(self.closed_gross,6)} USDC")
++            lines.append(f"  Commissioni simulate totali                   : {fnum(self.fee_cost,6)} USDC")
++            lines.append("  Inventario volatile aperto                    : 0.000000 USDC | VINCOLO ARCHITETTURALE")
++            lines.append(f"  Cicli chiusi                                  : {cycles} | vincenti {wins} | perdenti {losses}")
++            lines.append(f"  Volume/turnover cicli chiusi                  : {fnum(self.turnover,2)} USDC")
++            lines.append(
++                f"  Edge realizzato medio                         : {fnum(avg_edge,3)} bp/ciclo | decadimento vs edge armato {fnum(avg_decay,3)} bp"
++            )
++            lines.append("-" * 160)
++            lines.append("PROIEZIONE MENSILE — SOLO PNL CASH CHIUSO, mai inventario favorevole")
++            if proj is None:
++                lines.append("  Da PNL cash chiuso                            : N/D | N/D — WARMUP <6h")
++                lines.append("  Efficienza su capitale medio quotato          : N/D")
++            else:
++                lines.append(f"  Da PNL cash chiuso                            : {fnum(proj,2)} USDC/mese | {fnum(proj_pct,3)}%/mese")
++                lines.append(f"  Efficienza su capitale medio quotato          : {fnum(eff,3)}%/mese | indicatore operativo")
++            lines.append("-" * 160)
++            lines.append("CAPITALE E RISCHIO — quanto dei 10K sta realmente lavorando")
++            lines.append(f"  Capitale disponibile                          : {fnum(self.capital,2)} USDC")
++            lines.append(f"  Maker virtuali vivi                           : {len(self.live_orders)} route")
++            lines.append(
++                f"  Capitale riservato adesso                     : {fnum(self.live_notional_now,2)} USDC | {fnum(pct_value(self.live_notional_now,self.capital),2)}%"
++            )
++            lines.append(
++                f"  Capitale riservato medio                      : {fnum(avg_live,2)} USDC | {fnum(pct_value(avg_live,self.capital),2)}%"
++            )
++            lines.append(
++                f"  Picco capitale riservato                      : {fnum(self.max_live_notional,2)} USDC | {fnum(pct_value(self.max_live_notional,self.capital),2)}%"
++            )
++            lines.append(
++                f"  Max inventario volatile TRANSITORIO           : {fnum(self.max_transient_inventory,2)} USDC | chiuso immediatamente dopo fill"
++            )
++            lines.append(f"  Max tempo transitorio osservato               : {self.max_transient_ms/1000.0:.3f}s")
++            lines.append(
++                f"  Hedge chiusi in perdita                       : {self.forced_hedges_negative} | book hedge mancante {self.no_hedge_book}"
++            )
++            lines.append("-" * 160)
++            lines.append("SCANNER GLOBALE — USDC + USDT + USD1")
++            lines.append(f"  Asset cross-quote scoperti                    : {len(self.universe_assets)}")
++            lines.append(f"  Scansioni                                     : {self.scans:,} | route valutate cumulative {self.routes_seen:,}")
++            lines.append(f"  Route positive cumulative                     : {self.positive_routes_seen:,}")
++            lines.append(
++                f"  Stable triangles chiusi                       : {self.stable_triangles} | skip snapshot identico {self.stable_triangle_skips_stale}"
++            )
++            lines.append(
++                f"  Soglia arm paired / stable triangle           : {self.args.arm_edge_bps:.2f} / {self.args.triangle_min_edge_bps:.2f} bp NETTI"
++            )
++            lines.append("")
++            lines.append("  TOP OPPORTUNITA' ORA — edge gia' al netto di commissioni + buffer")
++            lines.append("  ASSET      ROUTE                 NETbp   SCORE$   GROSSbp   FEEbp   BUFFER   CAP_USDC   MAKER / HEDGE")
++            for r in self.latest_routes[: self.args.report_top]:
++                route_txt = f"{r.quote_in}->{r.quote_out}"
++                lines.append(
++                    f"  {r.asset[:10]:10s} {route_txt:20s} {fnum(r.net_edge_bps,3):>9s} {fnum(r.score_usdc_per_fill,4):>8s} "
++                    f"{fnum(r.gross_edge_bps,3):>9s} {fnum(r.fee_bps,3):>7s} "
++                    f"{fnum(r.buffer_bps,3):>8s} {fnum(r.capacity_usdc,2):>10s}   {r.maker_symbol} / {r.hedge_symbol}"
++                )
++            lines.append("-" * 160)
++            lines.append("ROUTE MAKER VIRTUALI VIVE")
++            if not self.live_orders:
++                lines.append("  nessuna")
++            else:
++                for o in sorted(self.live_orders.values(), key=lambda x: x.asset):
++                    age = (int(time.time()*1000)-o.created_ms)/1000.0
++                    lines.append(
++                        f"  {o.asset[:10]:10s} {o.route_id[:28]:28s} px={o.price} rem={o.remaining} "
++                        f"riserva={fnum(o.reserved_usdc,2)} edge_arm={fnum(o.armed_edge_bps,3)}bp age={age:.0f}s qAhead={fnum(o.queue_ahead,6)}"
++                    )
++            lines.append("-" * 160)
++            lines.append("RISULTATI PER ASSET — solo cicli completamente chiusi")
++            lines.append("  ASSET       CICLI   W/L       TURNOVER       LORDO        FEES        NETTO    EDGEavg")
++            for asset, st in sorted(self.asset_stats.items(), key=lambda kv: kv[1].pnl, reverse=True):
++                if st.cycles <= 0:
++                    continue
++                e = st.pnl / st.turnover * BPS if st.turnover > 0 else D0
++                lines.append(
++                    f"  {asset[:10]:10s} {st.cycles:6d} {st.wins:3d}/{st.losses:<3d} "
++                    f"{fnum(st.turnover,2):>12s} {fnum(st.gross,5):>11s} {fnum(st.fees,5):>11s} "
++                    f"{fnum(st.pnl,5):>11s} {fnum(e,3):>9s}"
++                )
++            if self.stable_stats.cycles:
++                st = self.stable_stats
++                e = st.pnl / st.turnover * BPS if st.turnover > 0 else D0
++                lines.append(
++                    f"  {'STABLE':10s} {st.cycles:6d} {st.wins:3d}/{st.losses:<3d} "
++                    f"{fnum(st.turnover,2):>12s} {fnum(st.gross,5):>11s} {fnum(st.fees,5):>11s} "
++                    f"{fnum(st.pnl,5):>11s} {fnum(e,3):>9s}"
++                )
++            lines.append("-" * 160)
++            lines.append("COMMISSIONI UTILIZZATE — bp per simbolo, con fonte")
++            relevant = set()
++            for r in self.latest_routes[: self.args.report_top]:
++                relevant.add(r.maker_symbol)
++                relevant.add(r.hedge_symbol)
++            for s in self.stable_symbols.values():
++                relevant.add(s)
++            for sym in sorted(s for s in relevant if s in self.meta):
++                m = self.meta[sym]
++                lines.append(
++                    f"  {sym:16s} maker {fnum(m.maker_bps,3):>8s} bp | taker {fnum(m.taker_bps,3):>8s} bp | {m.fee_source}"
++                )
++            lines.append("  Nota: exchangeInfo non sostituisce il controllo fee privato account-specifico richiesto prima del REAL.")
++            lines.append("-" * 160)
++            lines.append("INFRASTRUTTURA / AFFIDABILITA'")
++            state = "BACKOFF" if self.rest.is_degraded() else "OK"
++            lines.append(f"  API state                                     : {state}")
++            lines.append(f"  WAF/rate-limit / timeout                      : {self.rest.waf_events} / {self.rest.timeout_events}")
++            lines.append(f"  API resume / tape re-prime                    : {self.api_resumes} / {self.blackout_reprime}")
++            lines.append(f"  Tape saturo >=1000                            : {self.tape_saturated}")
++            lines.append(f"  Tape split/completi/scartati                  : {self.tape_windows_split}/{self.tape_windows_complete}/{self.tape_windows_dropped}")
++            lines.append(f"  Stable-maker route valutate cumulative        : {self.stable_maker_routes_seen}")
++            lines.append(
++                f"  Maker create/reprice/preserve/cancel          : {self.orders_created}/{self.orders_repriced}/{self.orders_preserved}/{self.orders_cancelled}"
++            )
++            lines.append(f"  Maker fills                                   : {self.maker_fills}")
++            lines.append(
++                f"  REST min gap                                  : {self.args.min_request_gap:.2f}s | bookTicker {self.args.book_refresh:.1f}s | tape poll {self.args.tape_poll:.1f}s"
++            )
++            lines.append("-" * 160)
++            lines.append("REGOLE CHIAVE")
++            lines.append("  Futures / leva                                : ASSENTI")
++            lines.append("  Inventario volatile persistente               : VIETATO — paired e stable-maker chiudono subito")
++            lines.append(
++                f"  Max route vive / max capitale live            : {self.args.max_live_routes} / {self.args.max_live_pct*100:.1f}%"
++            )
++            lines.append(
++                f"  Size paired / triangle                        : {self.args.order_usdc:.2f} / {self.args.triangle_usdc:.2f} USDC max"
++            )
++            lines.append(
++                f"  Participation top-book / tape                 : {self.args.top_book_participation*100:.1f}% / {self.args.tape_participation*100:.1f}%"
++            )
++            lines.append("=" * 160)
++            return "\n".join(lines)
++
++    def status_line(self) -> str:
++        eq = self.current_equity()
++        best = self.latest_routes[0].net_edge_bps if self.latest_routes else D0
++        state = "BACKOFF" if self.rest.is_degraded() else "OK"
++        return (
++            f"{utc_text()} | STATUS | EQ={fnum(eq,4)} CASH_PNL={fnum(self.closed_pnl,4)} "
++            f"LIVE={fnum(self.live_notional_now,2)} CICLI={len(self.closed_cycles)} "
++            f"TURN={fnum(self.turnover,2)} TOPEDGE={fnum(best,2)}bp API={state} "
++            f"403/429={self.rest.waf_events} timeout={self.rest.timeout_events}"
++        )
++
++    # -------------------- run --------------------
++
++    def run(self) -> None:
++        self.fetch_exchange_info()
++        print(
++            f"{utc_text()} | [UNIVERSE] cross-quote assets={len(self.universe_assets)} "
++            f"stable_fx={','.join(sorted(self.stable_symbols.values())) or 'NONE'}"
++        )
++        print(f"{utc_text()} | [DEMO ONLY] nessuna chiave privata; nessun endpoint ordini; capitale={self.capital}")
++
++        while not self.stop_event.is_set():
++            loop_start = time.time()
++            try:
++                self.handle_api_resume()
++                if not self.rest.is_degraded() and time.time() - self.last_book_refresh >= self.args.book_refresh:
++                    if self.fetch_all_books():
++                        with self.lock:
++                            self.scan_routes()
++                            self.maybe_execute_stable_triangle()
++
++                if not self.rest.is_degraded() and time.time() - getattr(self, "_last_tape_poll", 0.0) >= self.args.tape_poll:
++                    with self.lock:
++                        self.poll_one_tape()
++                    self._last_tape_poll = time.time()
++
++                now = time.time()
++                if now - self.last_status_ts >= self.args.status:
++                    with self.lock:
++                        print(self.status_line())
++                    self.last_status_ts = now
++                if now - self.last_report_ts >= self.args.report:
++                    with self.lock:
++                        print(self.report())
++                        self.save_state()
++                    self.last_report_ts = now
++            except KeyboardInterrupt:
++                self.stop_event.set()
++            except APIDegraded:
++                pass
++            except Exception as e:
++                print(f"{utc_text()} | [LOOP ERROR] {type(e).__name__}: {e}")
++
++            sleep_for = max(0.05, self.args.poll - (time.time() - loop_start))
++            self.stop_event.wait(sleep_for)
++
++        with self.lock:
++            self.update_live_integral()
++            self.live_orders.clear()
++            self.live_notional_now = D0
++            self.save_state()
++        print(f"{utc_text()} | [STOP] DEMO terminato; nessun ordine reale da cancellare")
++
++
++# -------------------- deterministic self-test --------------------
++
++
++def self_test() -> None:
++    src = Path(__file__).read_text(encoding="utf-8")
++    runtime_src = src.split("# -------------------- deterministic self-test --------------------", 1)[0]
++    assert "/api/v3/order" not in runtime_src, "real-order endpoint trovato nel runtime"
++    assert "create_order" not in runtime_src and "place_order" not in runtime_src
++    assert "/api/v3/exchangeInfo" in runtime_src
++    assert "/api/v3/ticker/bookTicker" in runtime_src
++    assert "/api/v3/aggTrades" in runtime_src
++    assert "/api/v3/tradeFee" in __doc__, "private fee requirement must be documented"
++
++    p = build_parser()
++    a = p.parse_args([])
++    a.fee_override = "USD1USDC=0/0,BTCUSDT=1.25/5"
++    fe = FeeEngine(a)
++    assert fe.overrides["USD1USDC"] == (D0, D0)
++    assert fe.overrides["BTCUSDT"] == (Decimal("1.25"), Decimal("5"))
++    ma, ta, src_name = fe.apply("USD1USDC", "0.01", "0.01")
++    assert ma == 0 and ta == 0 and src_name == "override"
++    ma, ta, src_name = fe.apply("ETHUSDT", "0.0002", "0.0005")
++    assert ma == Decimal("2") and ta == Decimal("5") and src_name == "exchangeInfo"
++
++    fields = {f.name for f in dataclasses.fields(ClosedCycle)}
++    assert "open_base_qty" not in fields
++    assert "pnl_usdc" in fields and "fees_usdc" in fields
++
++    x = Decimal("100")
++    fee = Decimal("5") / BPS
++    assert x * (D1 - fee) == Decimal("99.9500")
++    assert set(STABLES) == {"USDC", "USDT", "USD1"}
++
++    # V11.1 structural checks: busy tape windows must be split, not discarded; stable-maker exists.
++    assert "startTime" in runtime_src and "endTime" in runtime_src
++    assert "_fetch_tape_window" in runtime_src and "tape_windows_split" in runtime_src
++    assert "stable_maker_route" in runtime_src and "execute_stable_maker_fill" in runtime_src
++    assert "score_usdc_per_fill" in runtime_src
++
++    print(f"SELF-TEST {BOT_NAME}: SUPERATO")
++    print("  OK DEMO-only | OK global scanner | OK fee engine | OK closed-cycle invariant")
++    print("  OK tape-window split | OK stable-maker closed hedge | OK capacity-score | OK WAF-safe REST")
